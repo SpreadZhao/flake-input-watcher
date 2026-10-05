@@ -138,28 +138,12 @@ Home Manager module and is translated into systemd units.
 simultaneous checks. No action history is read or written; legacy `state.json`
 files are ignored and can be deleted.
 
-Run the isolated regression tests with `bash tests/check.sh`.
-They use a temporary local Git repository and simulated hooks/notifications,
-without accessing the network or sending desktop notifications.
-
-Check the Home Manager schedule and configuration interfaces with:
-
-```bash
-nix eval --impure --json --expr '
-  let f = builtins.getFlake ("path:" + toString ./.);
-  in import ./tests/module.nix {
-    pkgs = f.inputs.nixpkgs.legacyPackages.x86_64-linux;
-    homeManager = f.inputs.home-manager.outPath;
-  }'
-```
-
 ## Standalone flake
 
 ```nix
 inputs.flake-input-watcher = {
   url = "github:SpreadZhao/flake-input-watcher/main";
   inputs.nixpkgs.follows = "nixpkgs";
-  inputs.home-manager.follows = "home-manager";
 };
 # In a Home Manager module:
 imports = [ inputs.flake-input-watcher.homeManagerModules.default ];
@@ -173,7 +157,11 @@ The module is disabled by default and has no dependency on a configuration
 repository. With it enabled, scheduling defaults to five minutes after graphical
 login and every six hours. Set `flakePath` explicitly.
 
-Build with `nix build`, run CLI help with `nix run -- --help`, and test with
+Build with `nix build`, run CLI help with `nix run -- --help`, and check the package build with
 `nix flake check`. Packages, apps, checks, formatter and development shells are
 available for x86_64-linux and aarch64-linux. Source is under `src/`, packaging
-and the Home Manager module under `nix/`, and tests under `tests/`.
+and the Home Manager module under `nix/`.
+
+`nix flake check` builds the program and uses the built-in Bash syntax and
+ShellCheck checks from `writeShellApplication`. No custom test suite or Python
+test dependency is included.
