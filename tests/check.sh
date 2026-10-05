@@ -108,42 +108,55 @@ assert jq -se --arg old "$old" 'any(.[]; .input=="nixpkgs" and .ref=="nixos-unst
 assert test "$(count "$TEST_LOG/queries")" = 4
 assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 1
 edit_lock 'del(.nodes.root.inputs.cycle)'
+# Legacy action history is ignored, even when malformed, and never rewritten.
+assert test ! -e "$XDG_STATE_HOME/flake-input-watcher/state.json"
+printf 'legacy state is no longer used\n' >"$XDG_STATE_HOME/flake-input-watcher/state.json"
+cp "$XDG_STATE_HOME/flake-input-watcher/state.json" "$scratch/legacy-state"
 run
-assert test "$(count "$TEST_LOG/hooks")" = 4
-assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 1
+assert test "$(count "$TEST_LOG/hooks")" = 8
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 2
+assert cmp "$scratch/legacy-state" "$XDG_STATE_HOME/flake-input-watcher/state.json"
 
 # Dry-run on a fresh state directory causes neither hook execution nor state writes.
 XDG_STATE_HOME="$scratch/dry-state" "$watcher" check --dry-run --config "$config" >"$scratch/dry.json" 2>/dev/null
 assert test ! -e "$scratch/dry-state"
-assert test "$(count "$TEST_LOG/hooks")" = 4
+assert test "$(count "$TEST_LOG/hooks")" = 8
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 2
 
-# New remote revision re-arms actions; HEAD, branch, short tag and peeled tag all resolve.
+# HEAD, branch, short tag and peeled tag all resolve; every update runs its hooks.
 "$real_git" -C "$TEST_REMOTE" -c user.name=Test -c user.email=test@example.invalid commit -q --allow-empty -m newer
 newer=$("$real_git" -C "$TEST_REMOTE" rev-parse HEAD)
 "$real_git" -C "$TEST_REMOTE" branch -f nixos-unstable
 edit_lock '.nodes.tag.original.ref="v1"'
 run
-assert test "$(count "$TEST_LOG/hooks")" = 8 # three advancing inputs, plus the changed tag selector
-assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 2
+assert test "$(count "$TEST_LOG/hooks")" = 12
+assert jq -se --arg newer "$newer" --arg tag "$new" \
+    '.[-4:] | all(.[]; if .input=="tag" then .new==$tag else .new==$newer end)' "$TEST_LOG/hooks"
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 3
 
-# A failing hook alone retries, successful notification and other hooks do not.
+# Hook failures do not prevent notifications; all hooks run again next time.
 edit_config '.hooks.retry=.hooks.log | .rules += [{inputs:["nixpkgs"],hooks:["retry"]}]'
 touch "$TEST_LOG/hook-fail"
 run_failure
-assert jq -e '.failures==1' "$scratch/result.json"
+assert jq -e '.failures==5' "$scratch/result.json"
+assert test "$(count "$TEST_LOG/hooks")" = 12
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 4
 rm "$TEST_LOG/hook-fail"
 run
-assert test "$(count "$TEST_LOG/hooks")" = 9
-assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 2
+assert test "$(count "$TEST_LOG/hooks")" = 17
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 5
 
-# Notification failure is retried; shell hooks that succeeded stay completed.
+# Notification failure is isolated; successful shell hooks also repeat next time.
 edit_config '.hooks.second={type:"notify"} | .rules += [{inputs:["head"],hooks:["second"]}]'
 touch "$TEST_LOG/notify-fail"
 run_failure
+assert jq -e '.failures==1' "$scratch/result.json"
+assert test "$(count "$TEST_LOG/hooks")" = 22
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 5
 rm "$TEST_LOG/notify-fail"
 run
-assert test "$(count "$TEST_LOG/hooks")" = 9
-assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 3
+assert test "$(count "$TEST_LOG/hooks")" = 27
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 6
 
 # One unreachable input does not stop other queries; explicit refs/heads also work.
 edit_lock --arg old "$old" '.nodes.root.inputs.broken="broken" |
@@ -152,7 +165,7 @@ edit_lock --arg old "$old" '.nodes.root.inputs.broken="broken" |
 edit_config '.inputs.disabled.enable=true'
 run_failure
 assert jq -e '.failures==1 and any(.inputs[]; .input=="disabled" and .status=="update")' "$scratch/result.json"
-assert test "$(count "$TEST_LOG/hooks")" = 10
+assert test "$(count "$TEST_LOG/hooks")" = 33
 edit_lock 'del(.nodes.root.inputs.broken)'
 
 # Lock catching up eliminates updates. Adding/removing inputs is picked up each run.
@@ -160,10 +173,12 @@ edit_lock --arg rev "$newer" --arg tag "$new" '.nodes.nixpkgs_2.locked.rev=$rev 
     .nodes.default.locked.rev=$rev | .nodes.disabled.locked.rev=$rev | .nodes.tag.locked.rev=$tag'
 run
 assert jq -e 'all(.inputs[]; .status != "update")' "$scratch/result.json"
+assert test "$(count "$TEST_LOG/hooks")" = 33
+assert test "$(rg -c 'Flake inputs 有更新' "$TEST_LOG/notifications")" = 7
 edit_lock --arg old "$old" '.nodes.root.inputs.added="added" |
     .nodes.added={original:{type:"git",url:"https://test.invalid/repo",ref:"main"},locked:{rev:$old}}'
 run
-assert test "$(count "$TEST_LOG/hooks")" = 11
+assert test "$(count "$TEST_LOG/hooks")" = 34
 edit_lock 'del(.nodes.root.inputs.added)'
 run
 assert jq -e 'all(.inputs[]; .input != "added")' "$scratch/result.json"
@@ -190,7 +205,7 @@ edit_lock --arg old "$old" '.nodes.root.inputs.container="container" |
 run
 assert jq -e 'any(.inputs[]; .input=="nested" and .status=="current")' "$scratch/result.json"
 
-# Request and hook timeouts do not prevent later work or acknowledge failed actions.
+# Request and hook timeouts do not prevent later work or subsequent checks.
 touch "$TEST_LOG/block"
 run_failure
 rm "$TEST_LOG/block"
@@ -209,7 +224,7 @@ assert jq -e '.failures==1' "$scratch/result.json"
 edit_config --arg command "$scratch/hook" '.hooks.slow.command=$command'
 before=$(count "$TEST_LOG/hooks")
 run
-assert test "$(count "$TEST_LOG/hooks")" = "$((before + 1))"
+assert test "$(count "$TEST_LOG/hooks")" = "$((before + 3))"
 
 # Rebinding only a selected input does not notify other updates.
 edit_config '.rules=[{inputs:["nixpkgs"],hooks:["notify"]}]'

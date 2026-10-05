@@ -64,13 +64,13 @@ services.flake-input-watcher = {
 
 `inputs` controls whether to check. `hooks` defines named actions. `rules` binds
 input names to those actions. Exact names and `*` are supported; rules add to
-each other, and duplicate input/hook pairs run only once. Explicit `rules`
+each other, and duplicate input/hook pairs run only once per check. Explicit `rules`
 replace the default rule that binds all inputs to `notify`. To notify only about
 `nixpkgs`, use `rules = [ { inputs = [ "nixpkgs" ]; hooks = [ "notify" ]; } ];`.
 The `notify` hook is provided automatically, including when you define additional
 shell hooks; explicitly declaring it in the example is optional.
 
-Each shell hook is called **once per updated input**, with these environment
+Each shell hook is called **once per updated input on every check**, with these environment
 variables:
 
 | Variable | Value |
@@ -94,14 +94,9 @@ at the end of the check, even if multiple named notification hooks are matched.
 input names, refs, and twelve-character old/new revisions. No update means no
 notification.
 
-Successful actions are remembered separately for each checkout, input, source,
-ref, locked revision, remote revision and hook name. Rechecking the same event
-does not repeat a successful action; failed actions retry next time. A new
-remote revision or changed locked revision/ref re-arms the action. Adding a new
-hook also runs it for an existing pending update. Editing the body of a hook
-with the same name does not re-arm completed events. Delivery and state writing
-cannot be a single transaction: a process killed just after a hook succeeds may
-repeat that hook on the next check.
+Every check runs the matching hooks whenever an upstream revision differs from
+the lock file, including updates reported by previous checks. Successful actions
+are not remembered. Notifications repeat on every check while updates remain.
 
 ## Schedule and commands
 
@@ -128,7 +123,7 @@ journalctl --user -u flake-input-watcher.service
 ```
 
 `list-inputs` reads and describes inputs without network requests. `--dry-run`
-queries upstream and prints results, but runs no hooks and writes no state.
+queries upstream and prints results, but runs no hooks and creates no check lock.
 The PATH executable is supplied by the package.
 
 Configuration defaults to
@@ -139,11 +134,9 @@ JSON has `flakePath`, `inputs`, `hooks`, `rules`, `requestTimeout` and
 are **absolute executable paths**, not shell source. `schedule` belongs to the
 Home Manager module and is translated into systemd units.
 
-State lives in
-`${XDG_STATE_HOME:-$HOME/.local/state}/flake-input-watcher/state.json` with private
-permissions. The adjacent `check.lock` prevents simultaneous checks. Deleting
-the state file while no check is running re-arms all pending actions. The
-program refuses malformed state rather than silently repeating completed hooks.
+`${XDG_STATE_HOME:-$HOME/.local/state}/flake-input-watcher/check.lock` prevents
+simultaneous checks. No action history is read or written; legacy `state.json`
+files are ignored and can be deleted.
 
 Run the isolated regression tests with `bash tests/check.sh`.
 They use a temporary local Git repository and simulated hooks/notifications,

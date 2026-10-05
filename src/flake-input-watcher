@@ -6,7 +6,7 @@ usage() {
 Usage: flake-input-watcher [check|list-inputs] [--config PATH] [--dry-run]
 
 Check direct flake.lock inputs against their upstream Git refs.
---dry-run prints results without running hooks or writing state.
+--dry-run prints results without running hooks.
 Configuration defaults to $XDG_CONFIG_HOME/flake-input-watcher/config.json.
 EOF
 }
@@ -152,22 +152,6 @@ if ! "$dry_run"; then
 		exit 0
 	fi
 fi
-state_file="$state_dir/state.json"
-if [[ -f $state_file ]]; then
-	cp -- "$state_file" "$work_dir/state.json"
-	jq -e '.version == 1 and (.completed | type == "object")' "$work_dir/state.json" >/dev/null || die 'invalid state file'
-else
-	printf '{"version":1,"completed":{}}\n' >"$work_dir/state.json"
-fi
-
-record_success() {
-	local key=$1 state_tmp
-	jq --arg key "$key" '.completed[$key] = true' "$work_dir/state.json" >"$work_dir/state.next"
-	mv -- "$work_dir/state.next" "$work_dir/state.json"
-	state_tmp=$(mktemp "$state_dir/.state.XXXXXXXX")
-	cp -- "$work_dir/state.json" "$state_tmp"
-	mv -f -- "$state_tmp" "$state_file"
-}
 
 remote_revision() {
 	local source=$1 ref=$2 output oid name branch='' tag='' peeled='' exact=''
@@ -220,32 +204,25 @@ while IFS= read -r entry; do
 	entry=$(jq -c --arg rev "$remote_rev" --arg status "$status" '.remoteRev=$rev | .status=$status' <<<"$entry")
 	printf '%s\n' "$entry" >>"$work_dir/results.jsonl"
 	[[ $status == update ]] || continue
+	"$dry_run" && continue
 
 	mapfile -t hooks < <(jq -r --arg input "$input" '
         [(.rules // [])[] | select(.inputs | any(. == "*" or . == $input)) | .hooks[]] | unique[]
     ' "$config_file")
 	for hook in "${hooks[@]}"; do
-		event=$(jq -c --arg flake "$flake_path" --arg hook "$hook" \
-			'{flake:$flake,input,source,ref,lockedRev,remoteRev,hook:$hook}' <<<"$entry")
-		key=$(printf '%s' "$event" | sha256sum)
-		key=${key%% *}
-		if jq -e --arg key "$key" '.completed[$key] == true' "$work_dir/state.json" >/dev/null; then continue; fi
-		"$dry_run" && continue
 		hook_type=$(jq -r --arg hook "$hook" '.hooks[$hook].type' "$config_file")
 		if [[ $hook_type == notify ]]; then
-			jq -c --arg key "$key" '. + {key:$key}' <<<"$event" >>"$work_dir/notifications.jsonl"
+			printf '%s\n' "$entry" >>"$work_dir/notifications.jsonl"
 			continue
 		fi
 		hook_command=$(jq -r --arg hook "$hook" '.hooks[$hook].command' "$config_file")
-		if (
+		if ! (
 			cd -- "$flake_path"
 			timeout --kill-after=5 "$hook_timeout" env \
 				FLAKE_PATH="$flake_path" FLAKE_INPUT_NAME="$input" FLAKE_INPUT_SOURCE="$source" \
 				FLAKE_INPUT_REF="$ref" FLAKE_LOCKED_REV="$locked_rev" FLAKE_REMOTE_REV="$remote_rev" \
 				"$hook_command" 9>&- </dev/null >&2
 		); then
-			record_success "$key"
-		else
 			log "$input: hook $hook failed"
 			failures=$((failures + 1))
 		fi
@@ -260,11 +237,8 @@ if [[ -s $work_dir/notifications.jsonl ]]; then
             "\(.input | escape) [\(.ref | escape)]\n\(.lockedRev[0:12]) → \(.remoteRev[0:12])"
         ) | join("\n\n")
     ' "$work_dir/notifications.jsonl")
-	if timeout --kill-after=5 "$hook_timeout" notify-send --app-name=flake-input-watcher \
+	if ! timeout --kill-after=5 "$hook_timeout" notify-send --app-name=flake-input-watcher \
 		--icon=software-update-available -- 'Flake inputs 有更新' "$body" 9>&-; then
-		while IFS= read -r key; do record_success "$key"; done \
-			< <(jq -r '.key' "$work_dir/notifications.jsonl")
-	else
 		log 'notification delivery failed'
 		failures=$((failures + 1))
 	fi
